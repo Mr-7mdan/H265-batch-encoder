@@ -12,6 +12,7 @@ Usage:
     -min=X.YZ        : Ignore files smaller than X.YZ GB
     --regex="PATTERN"        Only include files matching the given regex pattern (e.g., --regex="\.avi$").
     -test=N          : Use N seconds for the test encode (default: 5)
+    -log            : Show ffmpeg log infos when encoding
     --dry-run       : Only show compatible files without encoding
     -keep-original : Keep original files instead of replacing them
     -allow-h265    : Allow files already encoded in H.265
@@ -30,6 +31,9 @@ Usage:
 # ===========================
 # User Configuration Section
 # ===========================
+
+# Notification env file
+source /scripts/notification.env
 
 # Enable hardware acceleration (true/false)
 # true  = use GPU for decoding/encoding (faster, lower CPU usage)
@@ -107,7 +111,7 @@ ENCODE_PRESET="p3"
 
 # Duration in seconds for test encoding (used to estimate file size before full encoding)
 # Helps skip files where re-encoding won’t reduce size significantly
-# Sample will be taken at 1/4th of the duration
+# Sample will be taken at 1/4th, 1/2 and 3/4th of the duration
 TEST_DURATION=5
 
 #Expected ratio between old and new encoded file to allow transcoding
@@ -116,7 +120,8 @@ MIN_SIZE_RATIO=0.8
 #Skip files below this bitrate (in kbps)
 MIN_BITRATE=2500
 MIN_BYTE_PER_SEC=$((MIN_BITRATE * 1000 / 8))
-
+MARK_AS_ENCODED=true
+ENCODE_FAILED=true
 
 ###################
 # System settings
@@ -136,6 +141,9 @@ PURGE_ONLY=0
 STOP_AFTER_HOURS=0
 REGEX_FILTER=""
 RETRY=0
+LOGLEVEL="error" # par défaut, on reste silencieux
+TIMEOUT=3600 #1h in seconds
+TIMEOUT_SAMPLE=8 #seconds
 
 
 # =====================
@@ -184,9 +192,9 @@ build_ffmpeg_command() {
 
   if [[ "$mode" == "test" ]]; then
     ffmpeg_opts+=("-ss" "$offset" "-t" "$TEST_DURATION")
-    timeout_limit=$((30 * 5))  # 5 minutes
+    timeout_limit=$TIMEOUT_SAMPLE 
   else
-    timeout_limit=$((3 * 3600)) # 3 hours
+    timeout_limit=$TIMEOUT 
   fi
   
   # in case of subtitle error
@@ -207,16 +215,26 @@ build_ffmpeg_command() {
       AUDIO_CODEC="copy"
     fi
   fi
+  
+  # ---- Nouveau : filtrer uniquement le flux vidéo principal ----
+  # On récupère le premier flux vidéo qui n’est pas mjpeg
+  main_video_index=$(ffprobe -v error -select_streams v -show_entries stream=index,codec_name \
+                     -of csv=p=0 "$input_file" | grep -v '^.*,mjpeg$' | head -n1 | cut -d',' -f1)
+
+  # On mappe uniquement le flux vidéo principal + audio + sous-titres
+  map_args=("-map" "0:${main_video_index}" "-map" "0:a?" "-map" "0:s?")
 
   timeout --foreground "$timeout_limit" \
-    ffmpeg -y "${ffmpeg_opts[@]}" \
-    -i "$input_file" \
-    -map 0:v -map 0:a? -map 0:s? -hide_banner -loglevel error "${stats_opts[@]}" \
-    -c:v "$VIDEO_CODEC" -preset "$ENCODE_PRESET" -rc vbr -cq "$cq_value" \
-    -c:a "$AUDIO_CODEC" -b:a "$AUDIO_BITRATE" \
-    -c:s copy \
-    "${container_args[@]}" \
-    "$output_file"
+  ffmpeg -y "${ffmpeg_opts[@]}" \
+  -fflags +genpts -avoid_negative_ts make_zero \
+  -i "$input_file" \
+  "${map_args[@]}" -hide_banner -loglevel "$LOGLEVEL" "${stats_opts[@]}" \
+  -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -preset "$ENCODE_PRESET" -rc vbr -cq "$cq_value" \
+  -c:a "$AUDIO_CODEC" -b:a "$AUDIO_BITRATE" \
+  -c:s copy \
+  "${container_args[@]}" \
+  "$output_file"
+
 }
 
 
@@ -284,6 +302,7 @@ while [[ $# -gt 0 ]]; do
     --clean) CLEAN_ONLY=1 ; shift ;;
     --purge) PURGE_ONLY=1 ; shift ;;
     --retry) RETRY=1 ; shift ;;
+    -log) LOGLEVEL="info"; shift ;;
 	  -stop-after) STOP_AFTER_HOURS=$(echo "$2" | sed 's/,/./' | awk '{printf "%.0f", $1}'); shift 2 ;;
     -regex=*) REGEX_FILTER="${1#--regex=}" ; shift ;;
     -h) usage ;;
@@ -302,7 +321,7 @@ if (( CLEAN_ONLY > 0 )); then
   find_opts=( "$FOLDER" )
   (( RECURSIVE == 0 )) && find_opts+=( -maxdepth 1 )
 
-  patterns=( -name '.tmp_encode_*' -o -name '.tmp_encode_test_*' )
+  patterns=( -name '.tmp_encode_*' -o -name '.tmp_encode_test_*' -o -name 'encoded_tmp*' )
 
   find "${find_opts[@]}" -type f \( "${patterns[@]}" \) -print0 |
   while IFS= read -r -d '' file; do
@@ -392,6 +411,9 @@ EOF
 
 print_config
 
+send_notif "New H265 encoding process started at $(date +"%H:%M:%S")
+$FOLDER"
+
 find_cmd=(find "$FOLDER")
 [[ $RECURSIVE -eq 0 ]] && find_cmd+=( -maxdepth 1 )
 find_cmd+=( -type f \( -iname '*.mkv' -o -iname '*.avi' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.wmv' -o -iname '*.flv' \) )
@@ -443,10 +465,29 @@ while IFS= read -r f; do
   [[ "$codec_name" == "hevc" && $ALLOW_H265 -eq 0 ]] && continue
   [[ "$codec_name" == "av1" && $ALLOW_AV1 -eq 0 ]] && continue
 
-  #detect duration
-  duration=$(ffprobe -v quiet -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$f")
+  # Robust duration detection
+  duration=$(ffprobe -v error -select_streams v:0 -show_entries format=duration \
+    -of default=nokey=1:noprint_wrappers=1 "$f" 2>/dev/null)
+
+  # Normalize duration string (decimal comma to dot)
+duration="${duration//,/.}"
+
+# Validate the duration (must be a positive number)
+if [[ -z "$duration" || ! "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  duration_int=1
+else
   duration_int=${duration%.*}
-  [[ -z "$duration_int" || "$duration_int" -le 0 ]] && continue
+  [[ "$duration_int" -gt 0 ]] || duration_int=1
+fi
+
+if (( size_bytes / duration_int < MIN_BYTE_PER_SEC )); then
+  if [ "$MARK_AS_ENCODED" = "true" ]; then
+    echo "$base" >> "$list_file"
+  fi
+  continue
+fi
+
+
   
   candidates+=("$f")
 
@@ -473,6 +514,9 @@ if (( DRY_RUN == 1 )); then
 fi
 
 
+send_notif "$FOLDER
+$all_videos video files found / ${#candidates[@]} will be encoded / $already_encoded indicated as encoded / $already_failed indicated as failed"
+
 
 # =====================
 # Encoding tasks
@@ -489,12 +533,29 @@ for f in "${candidates[@]}"; do
   list_file="$dir/encoded.list"
   failed_file="$dir/failed.list"
   size_bytes=$(stat -c%s "$f")
-  duration=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$f")
-  duration_int=${duration%.*}
-  duration_view=$(printf '%02d:%02d:%02d' $((duration_int/3600)) $(( (duration_int%3600)/60 )) $((duration_int%60)))
   height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
   channels=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$f")
   
+
+    # Get duration using ffprobe (robust version)
+  # Force C locale for ffprobe numeric output and normalize commas to dots
+  duration=$(LC_ALL=C ffprobe -v error -select_streams v:0 -show_entries format=duration \
+    -of default=nokey=1:noprint_wrappers=1 "$f" 2>/dev/null || true)
+  # Normalise la virgule en point (au cas où la locale aurait renvoyé "6,123")
+  duration="${duration//,/.}"
+  # Validate the duration (must be a positive number)
+  if [[ -z "$duration" || ! "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    duration_int=1
+  else
+    duration_int=${duration%.*}
+    if ! [[ "$duration_int" =~ ^[0-9]+$ ]] || (( duration_int <= 0 )); then
+      duration_int=1
+    fi
+  fi
+  duration_view=$(printf '%02d:%02d:%02d' $((duration_int/3600)) $(( (duration_int%3600)/60 )) $((duration_int%60)))
+
+
+
   # Try to get the video width using ffprobe
   width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
 
@@ -518,6 +579,8 @@ for f in "${candidates[@]}"; do
     if (( elapsed >= stop_after_seconds )); then
       echo ""
       echo "⏱️  Stop limit of $STOP_AFTER_HOURS hour(s) reached. Exiting."
+      send_notif "⏱️  Stop limit of $STOP_AFTER_HOURS hour(s) reached at $(date +"%H:%M:%S"). Exiting...
+      $FOLDER"
       break
     fi
   fi
@@ -532,19 +595,7 @@ for f in "${candidates[@]}"; do
   [[ "$ext_lower" == "avi" || "$ext_lower" == "mp4" ]] && output_ext="mkv"
   tmp_file="$dir/.tmp_encode_${base%.*}.$output_ext"
   tmp_test="$dir/.tmp_encode_test_${base}"
-  
-  
-##############################
-# EXCLUDING SMALL FILES
-###############################
-  
-  if (( size_bytes / duration_int < MIN_BYTE_PER_SEC )); then
-  echo "🔎 So small, no sample needed !"
-  echo "$base" >> "$list_file"
-  echo "✅ Marked as encoded "
 
-  continue
-  fi
 
 ##############################
 # SAMPLING
@@ -565,9 +616,9 @@ test_number=0
 print_timeline() {
   local step=$1
   case $step in
-    1) echo "|---🔎---|----|----| @ $(( duration_int / 4 ))s" ;;
-    2) echo "|----|---🔎---|----| @ $(( duration_int / 2 ))s";;
-    3) echo "|----|----|---🔎---| @ $(( duration_int * 3 / 4 ))s" ;;
+    1) echo -ne "\r|---🔎---|----|----| @ $(( duration_int / 4 ))s" ;;
+    2) echo -ne "\r|----|---🔎---|----| @ $(( duration_int / 2 ))s";;
+    3) echo -ne "\r|----|----|---🔎---| @ $(( duration_int * 3 / 4 ))s" ;;
     *) echo "|----|----|----|----|" ;;  #fallback
   esac
 }
@@ -578,10 +629,27 @@ for offset_auto in "${offsets[@]}"; do
   test_number=$((test_number + 1))
 
   # Affichage graphique ASCII de la timeline avec curseur
-  print_timeline $test_number
+  print_timeline "$test_number"
 
-  if ! build_ffmpeg_command "$f" "$tmp_test" "$duration" test "$offset_auto" "$file_CQ" < /dev/null ; then
-    echo "├── ❌ Test encoding failed at offset ${offset_auto}s"
+  if [[ "$LOGLEVEL" == "info" || "$LOGLEVEL" == "verbose" ]]; then
+    echo ""
+    echo "│ ▶️  Running sample test at offset ${offset_auto}s (log level: $LOGLEVEL)"
+    build_ffmpeg_command "$f" "$tmp_test" "$duration" test "$offset_auto" "$file_CQ" < /dev/null
+    ret=$?
+  else
+    # mode silencieux par défaut
+    if ! build_ffmpeg_command "$f" "$tmp_test" "$duration" test "$offset_auto" "$file_CQ" < /dev/null >/dev/null 2>&1 ; then
+      echo -ne "\r├── ❌ Test encoding failed at offset ${offset_auto}s"
+      rm -f "$tmp_test"
+      success=false
+      break
+    fi
+    ret=0
+  fi
+
+  # Vérifie le résultat du test
+  if (( ret != 0 )); then
+    echo -ne "\r├── ❌ Test encoding failed at offset ${offset_auto}s"
     rm -f "$tmp_test"
     success=false
     break
@@ -592,11 +660,6 @@ for offset_auto in "${offsets[@]}"; do
   rm -f "$tmp_test"
 done
 
-# If any test failed, skip the file and mark it as failed
-if ! $success; then
-  echo "$base" >> "$failed_file"
-  continue
-fi
 
 # 🔸 Calcul de la médiane
 IFS=$'\n' sorted_sizes=($(sort -n <<<"${test_sizes[*]}"))
@@ -605,31 +668,56 @@ median_test_size=${sorted_sizes[1]}  # 2e élément de la liste triée (index 1)
 
 # 🔸 Estimation avec la médiane
 estimated_size=$(( median_test_size * duration_int / TEST_DURATION ))
-echo "├── Estimated size (median of 3 samples): $(print_size "$estimated_size")"
+echo -ne "\r├── Estimated size (median of 3 samples): $(print_size "$estimated_size")"
 
 threshold_bytes=$(awk "BEGIN {printf \"%d\", $MIN_SIZE_RATIO * $size_bytes}")
 
-if (( estimated_size >= threshold_bytes )); then
+if (( estimated_size == 0 )); then
+  echo ""
+  echo "├── ❌ Estimated size is 0 bytes, possible error"
+
+  if [[ "$ENCODE_FAILED" != true ]]; then
+    echo "│   → Skipping (ENCODE_FAILED is false)"
+    echo "$base" >> "$list_file"
+    rm -f "$tmp_test"
+    success=false
+    continue
+  else
+    echo "│   → Not skipping because ENCODE_FAILED=true"
+  fi
+
+elif (( estimated_size >= threshold_bytes )); then
   perc=$(awk "BEGIN {printf \"%.0f\", $MIN_SIZE_RATIO * 100}")
+  echo ""
   echo "├── ❌ Estimated size > ${perc}% of original, skipping"
   echo "$base" >> "$list_file"
   continue
 fi
 
+
 ##############################
 # FULL ENCODING
 ###############################
 
-
+echo""
 echo "▶️  Full encoding ($duration_view)"
   
-output=$(build_ffmpeg_command "$f" "$tmp_file" "$duration" "$file_CQ" < /dev/null 2>&1 | tee >(cat >&2))
+output=$(build_ffmpeg_command "$f" "$tmp_file" "$duration" "full" 0 "$file_CQ" < /dev/null 2>&1 | tee >(cat >&2))
 ffmpeg_status=$?
+
+if [[ $ffmpeg_status -ne 0 ]]; then
+  echo "├── ⚠️ Retry: forcing audio to AAC and removing subtitles"
+  build_ffmpeg_command "$f" "$tmp_file" "$duration" "full" 0 "$file_CQ" < /dev/null >/dev/null 2>&1 \
+    -c:a aac -b:a "$AUDIO_BITRATE" -sn
+  ffmpeg_status=$?
+fi
+
 
 # Case 1: Subtitle codec issue — retry without subtitles
 if echo "$output" | grep -qE 'Subtitle codec|Could not write header'; then
   echo "├── ⚠️ Subtitle codec error detected, retrying without subtitles..."
-  output=$(build_ffmpeg_command "$f" "$tmp_file" "$duration" "$cq" no_sub < /dev/null 2>&1 | tee >(cat >&2))
+  output=$(build_ffmpeg_command "$f" "$tmp_file" "$duration" "no_sub" 0 "$file_CQ" < /dev/null 2>&1 | tee >(cat >&2))
+  
   if [ $? -eq 0 ]; then
     echo "├── ✅ Encoding succeeded without subtitles"
   else
@@ -713,3 +801,9 @@ echo "🎥  Video file replacement"
   fi
   echo "$base" >> "$list_file"
 done
+
+echo "FINISHED !"
+
+send_notif "$FOLDER
+Process ended at $(date +"%H:%M:%S") 
+$encoding_number / ${#candidates[@]}"
